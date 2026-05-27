@@ -53,8 +53,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         scoreText = TextView(this).apply {
-            text = "Depth: 0m"
-            setTextColor(0xFF00FF88.toInt())
+            text = "Height: 0"
+            setTextColor(0xFFFF3366.toInt())
             textSize = 18f
             setPadding(32, 32, 32, 8)
             typeface = Typeface.MONOSPACE
@@ -103,9 +103,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
-    private fun updateScore(depth: Int) {
+    private fun updateScore(height: Int) {
         runOnUiThread {
-            scoreText.text = "Depth: ${depth}m"
+            scoreText.text = "Height: $height"
         }
     }
 
@@ -217,100 +217,101 @@ class MainActivity : AppCompatActivity() {
 }
 
 class GameView(context: Context, private val scoreCallback: (Int) -> Unit) : View(context) {
+
+    data class LineSegment(
+        val x1: Float, val y1: Float,
+        val x2: Float, val y2: Float,
+        val creationTime: Long
+    )
+
+    data class GravityWell(
+        val x: Float, val y: Float,
+        val creationTime: Long
+    )
+
     companion object {
-        const val TILE_SIZE = 60f
-        const val CAVE_WIDTH = 20
-        const val SONAR_RADIUS = 180f
-        const val BLAST_RADIUS = 120f
-        const val TAG = "GameView"
+        const val FADE_MS = 3000L
+        const val GRAVITY = 0.45f
+        const val BOUNCE = 0.55f
+        const val WELL_FORCE = 80f
+        const val LONG_PRESS_MS = 500L
+        const val SEGMENT_MIN_LEN = 6f
+        const val CHAR_RADIUS = 16f
+        const val WELL_RADIUS = 40f
+        const val VELOCITY_DAMP = 0.995f
     }
 
-    private val cave = Array(200) { BooleanArray(CAVE_WIDTH) }
-    private val revealed = Array(200) { BooleanArray(CAVE_WIDTH) }
-    private val enemies = mutableListOf<Enemy>()
-    private var playerX = CAVE_WIDTH / 2f
-    private var playerY = 15f
-    private var currentDepth = 0
+    private val lines = mutableListOf<LineSegment>()
+    private val wells = mutableListOf<GravityWell>()
+
+    private var charX = 0f
+    private var charY = 0f
+    private var charVX = 0f
+    private var charVY = 0f
+
+    private var drawStartX = 0f
+    private var drawStartY = 0f
+    private var isDrawing = false
+    private var longPressTriggered = false
+    private var touchStartTime = 0L
+
     private var gameOver = false
-    private var sonarPings = mutableListOf<SonarPing>()
-    private var directionalBlast: DirectionalBlast? = null
-    private var longPressActive = false
-    private var longPressX = 0f
-    private var longPressY = 0f
-    private val random = Random()
+    private var maxHeight = 0f
+    private var initialized = false
 
-    private val wallPaint = Paint().apply { color = 0xFF1A2A3A.toInt(); style = Paint.Style.FILL }
-    private val wallRevealedPaint = Paint().apply { color = 0xFF234A6A.toInt(); style = Paint.Style.FILL }
-    private val bgPaint = Paint().apply { color = 0xFF0A0A1A.toInt(); style = Paint.Style.FILL }
-    private val sonarPaint = Paint().apply { color = 0x3300FF88.toInt(); style = Paint.Style.FILL }
-    private val enemyPaint = Paint().apply { color = 0xFFFF3344.toInt(); style = Paint.Style.FILL }
-    private val enemyStunnedPaint = Paint().apply { color = 0xFF886622.toInt(); style = Paint.Style.FILL }
-    private val playerPaint = Paint().apply { color = 0xFF00CCFF.toInt(); style = Paint.Style.FILL }
-    private val playerGlowPaint = Paint().apply { color = 0x3300CCFF.toInt(); style = Paint.Style.FILL }
-    private val blastPaint = Paint().apply { color = 0x6600FF88.toInt(); style = Paint.Style.FILL }
-    private val pathPaint = Paint().apply { color = 0xFFFF8800.toInt(); style = Paint.Style.STROKE; strokeWidth = 2f; pathEffect = DashPathEffect(floatArrayOf(8f, 8f), 0f) }
-    private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
-
-    init {
-        generateCave()
-        startSonarReveal()
+    private val bgPaint = Paint().apply {
+        color = 0xFF0A0A1A.toInt()
+        style = Paint.Style.FILL
     }
 
-    private fun generateCave() {
-        for (y in 0 until 200) {
-            for (x in 0 until CAVE_WIDTH) {
-                cave[y][x] = true
-            }
-        }
-        var cx = CAVE_WIDTH / 2f
-        var cy = 0f
-        while (cy < 190) {
-            val r = 1.5f + random.nextFloat() * 3f
-            for (y in max(0f, cy - r).toInt()..min(199f, cy + r).toInt()) {
-                for (x in max(0f, cx - r).toInt()..min((CAVE_WIDTH - 1).toFloat(), cx + r).toInt()) {
-                    cave[y][x] = false
-                }
-            }
-            cx += (random.nextFloat() - 0.5f) * 2.5f
-            cx = cx.coerceIn(1.5f, CAVE_WIDTH - 2.5f)
-            cy += 1f + random.nextFloat() * 2f
-        }
-        for (y in 0..3) {
-            for (x in (CAVE_WIDTH / 2 - 2)..(CAVE_WIDTH / 2 + 2)) {
-                cave[y][x] = false
-            }
-        }
-        for (i in 0 until 15) {
-            val ey = 30 + random.nextInt(170)
-            val ex = random.nextInt(CAVE_WIDTH)
-            if (!cave[ey][ex]) {
-                enemies.add(Enemy(ex.toFloat(), ey.toFloat()))
-            }
-        }
+    private val linePaint = Paint().apply {
+        color = 0xFFFF3366.toInt()
+        strokeWidth = 7f
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
     }
 
-    private fun startSonarReveal() {
-        postDelayed({
-            if (!gameOver) {
-                sonarPings.add(SonarPing(playerX, playerY, SONAR_RADIUS * 0.25f, 500))
-                startSonarReveal()
-            }
-        }, 2000)
+    private val wellRingPaint = Paint().apply {
+        color = 0xFFFF3366.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
     }
 
-    private fun revealArea(cx: Float, cy: Float, radius: Float) {
-        val tileR = radius / TILE_SIZE
-        val minX = ((cx - tileR).toInt().coerceAtLeast(0))
-        val maxX = ((cx + tileR).toInt().coerceAtMost(CAVE_WIDTH - 1))
-        val minY = ((cy - tileR).toInt().coerceAtLeast(0))
-        val maxY = ((cy + tileR).toInt().coerceAtMost(199))
-        for (y in minY..maxY) {
-            for (x in minX..maxX) {
-                val dist = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy))
-                if (dist <= tileR) {
-                    revealed[y][x] = true
-                }
-            }
+    private val wellFillPaint = Paint().apply {
+        color = 0x22FF3366.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val charPaint = Paint().apply {
+        color = 0xFF00CCFF.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val charGlowPaint = Paint().apply {
+        color = 0x2200CCFF.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val dividerPaint = Paint().apply {
+        color = 0x15FFFFFF.toInt()
+        strokeWidth = 3f
+    }
+
+    private val zoneLabelPaint = Paint().apply {
+        color = 0x22FFFFFF.toInt()
+        textSize = 28f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.MONOSPACE
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (!initialized) {
+            charX = w * 0.78f
+            charY = h * 0.25f
+            initialized = true
+            post(gameLoop)
         }
     }
 
@@ -321,54 +322,48 @@ class GameView(context: Context, private val scoreCallback: (Int) -> Unit) : Vie
         }
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                longPressActive = true
-                longPressX = event.x
-                longPressY = event.y
-                postDelayed({
-                    if (longPressActive) {
-                        sonarPings.add(SonarPing(playerX, playerY, SONAR_RADIUS, 1200))
-                        val dx = longPressX - width / 2f
-                        val dy = longPressY - height / 2f
-                        val angle = atan2(dy.toDouble(), dx.toDouble()).toFloat()
-                        sonarPings.add(SonarPing(
-                            playerX + cos(angle) * 1.5f,
-                            playerY + sin(angle) * 1.5f,
-                            BLAST_RADIUS,
-                            600
-                        ))
-                        val blast = DirectionalBlast(playerX, playerY, angle, BLAST_RADIUS)
-                        directionalBlast = blast
-                        for (enemy in enemies) {
-                            if (enemy.stunned <= 0) {
-                                val edx = enemy.x - playerX
-                                val edy = enemy.y - playerY
-                                val dist = sqrt(edx * edx + edy * edy)
-                                val enemyAngle = atan2(edy.toDouble(), edx.toDouble()).toFloat()
-                                val angleDiff = abs(((angle - enemyAngle + PI * 3) % (PI * 2) - PI).toFloat())
-                                if (dist < BLAST_RADIUS / TILE_SIZE && angleDiff < PI / 4f) {
-                                    enemy.stunned = 5000
-                                }
-                            }
-                        }
-                    }
-                }, 600)
+                isDrawing = true
+                longPressTriggered = false
+                drawStartX = event.x
+                drawStartY = event.y
+                touchStartTime = System.currentTimeMillis()
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                longPressActive = false
-                removeCallbacks(null)
-                if (event.eventTime - event.downTime < 400) {
-                    sonarPings.add(SonarPing(playerX, playerY, SONAR_RADIUS, 1000))
-                    for (enemy in enemies) {
-                        if (enemy.stunned <= 0) {
-                            val dx = enemy.x - playerX
-                            val dy = enemy.y - playerY
-                            val dist = sqrt(dx * dx + dy * dy)
-                            if (dist < SONAR_RADIUS / TILE_SIZE * 0.8f) {
-                                enemy.speed = minOf(enemy.speed * 1.3f, 0.05f)
-                            }
-                        }
+            MotionEvent.ACTION_MOVE -> {
+                if (!isDrawing) return true
+
+                val elapsed = System.currentTimeMillis() - touchStartTime
+                val distFromStart = sqrt(
+                    (event.x - drawStartX).pow(2) + (event.y - drawStartY).pow(2)
+                )
+
+                if (elapsed > LONG_PRESS_MS && distFromStart < 30f && !longPressTriggered) {
+                    longPressTriggered = true
+                    wells.add(GravityWell(event.x, event.y, System.currentTimeMillis()))
+                    drawStartX = event.x
+                    drawStartY = event.y
+                    return true
+                }
+
+                if (!longPressTriggered || elapsed > LONG_PRESS_MS) {
+                    val segDx = event.x - drawStartX
+                    val segDy = event.y - drawStartY
+                    val segLen = sqrt(segDx * segDx + segDy * segDy)
+                    if (segLen > SEGMENT_MIN_LEN) {
+                        lines.add(
+                            LineSegment(
+                                drawStartX, drawStartY,
+                                event.x, event.y,
+                                System.currentTimeMillis()
+                            )
+                        )
+                        drawStartX = event.x
+                        drawStartY = event.y
                     }
                 }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                isDrawing = false
+                longPressTriggered = false
             }
         }
         return true
@@ -379,189 +374,194 @@ class GameView(context: Context, private val scoreCallback: (Int) -> Unit) : Vie
             if (gameOver) return
             update()
             invalidate()
-            postDelayed(this, 33)
+            postDelayed(this, 16)
         }
-    }
-
-    init {
-        post(gameLoop)
     }
 
     private fun update() {
-        playerY += 0.03f
-        if (playerY.toInt() % 10 == 0 && playerY.toInt() != currentDepth) {
-            currentDepth = playerY.toInt()
-            scoreCallback(currentDepth)
+        val now = System.currentTimeMillis()
+
+        lines.removeAll { now - it.creationTime > FADE_MS }
+        wells.removeAll { now - it.creationTime > FADE_MS }
+
+        charVY += GRAVITY
+
+        for (well in wells) {
+            val age = now - well.creationTime
+            val strength = (1f - age.toFloat() / FADE_MS).coerceIn(0f, 1f)
+            val dx = well.x - charX
+            val dy = well.y - charY
+            val distSq = dx * dx + dy * dy
+            val dist = sqrt(distSq).coerceAtLeast(1f)
+            val force = (WELL_FORCE * strength) / dist
+            charVX += (dx / dist) * force
+            charVY += (dy / dist) * force
         }
-        if (playerY.toInt() in cave.indices) {
-            val px = playerX.toInt().coerceIn(0, CAVE_WIDTH - 1)
-            if (cave[playerY.toInt()][px]) {
-                gameOver = true
-            }
+
+        charVX *= VELOCITY_DAMP
+        charVY *= VELOCITY_DAMP
+
+        charX += charVX
+        charY += charVY
+
+        if (charX - CHAR_RADIUS < 0f) {
+            charX = CHAR_RADIUS
+            charVX = abs(charVX) * BOUNCE
         }
-        if (playerY >= 199f) {
+        if (charX + CHAR_RADIUS > width) {
+            charX = width - CHAR_RADIUS
+            charVX = -abs(charVX) * BOUNCE
+        }
+        if (charY - CHAR_RADIUS < 0f) {
+            charY = CHAR_RADIUS
+            charVY = abs(charVY) * BOUNCE
+        }
+        if (charY > height + CHAR_RADIUS * 2) {
             gameOver = true
+            return
         }
 
-        val iter = enemies.iterator()
-        while (iter.hasNext()) {
-            val e = iter.next()
-            if (e.stunned > 0) {
-                e.stunned -= 33
-                continue
-            }
-            val dx = playerX - e.x
-            val dy = playerY - e.y
-            val dist = sqrt(dx * dx + dy * dy)
-            if (dist < 0.6f) {
-                gameOver = true
-                return
-            }
-            if (dist > 0.2f) {
-                e.x += (dx / dist * e.speed).toFloat()
-                e.y += (dy / dist * e.speed * 0.5f).toFloat()
-            }
-            e.x = e.x.coerceIn(0f, CAVE_WIDTH - 1f)
-            e.y = e.y.coerceIn(0f, 199f)
+        for (seg in lines) {
+            resolveCollision(seg)
         }
 
-        val pingIter = sonarPings.iterator()
-        while (pingIter.hasNext()) {
-            val p = pingIter.next()
-            val maxDist = p.radius / TILE_SIZE
-            val progress = p.lerp()
-            val currentRadius = maxDist * progress
-            revealArea(p.x, p.y, currentRadius)
-            if (progress >= 1f && p.elapsed > p.duration) {
-                pingIter.remove()
+        val currentHeight = height - charY
+        if (currentHeight > maxHeight) {
+            maxHeight = currentHeight
+            scoreCallback(maxHeight.toInt())
+        }
+    }
+
+    private fun resolveCollision(seg: LineSegment) {
+        val ldx = seg.x2 - seg.x1
+        val ldy = seg.y2 - seg.y1
+        val lenSq = ldx * ldx + ldy * ldy
+        if (lenSq < 0.01f) {
+            val d = sqrt((charX - seg.x1).pow(2) + (charY - seg.y1).pow(2))
+            if (d < CHAR_RADIUS) {
+                val nx = (charX - seg.x1) / d
+                val ny = (charY - seg.y1) / d
+                charX += (CHAR_RADIUS - d) * nx
+                charY += (CHAR_RADIUS - d) * ny
+                val dot = charVX * nx + charVY * ny
+                if (dot < 0f) {
+                    charVX -= 2f * dot * nx * BOUNCE
+                    charVY -= 2f * dot * ny * BOUNCE
+                }
             }
-            p.elapsed += 33
+            return
         }
 
-        directionalBlast?.let {
-            it.elapsed += 33
-            if (it.elapsed > 600) directionalBlast = null
+        var t = ((charX - seg.x1) * ldx + (charY - seg.y1) * ldy) / lenSq
+        t = t.coerceIn(0f, 1f)
+
+        val closestX = seg.x1 + t * ldx
+        val closestY = seg.y1 + t * ldy
+
+        val dx = charX - closestX
+        val dy = charY - closestY
+        val dist = sqrt(dx * dx + dy * dy)
+
+        if (dist < CHAR_RADIUS && dist > 0.001f) {
+            val nx = dx / dist
+            val ny = dy / dist
+            charX += (CHAR_RADIUS - dist) * nx
+            charY += (CHAR_RADIUS - dist) * ny
+            val dot = charVX * nx + charVY * ny
+            if (dot < 0f) {
+                charVX -= 2f * dot * nx * BOUNCE
+                charVY -= 2f * dot * ny * BOUNCE
+            }
         }
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
-
-        val viewHeight = height.toFloat()
         val viewWidth = width.toFloat()
-        val offsetX = (viewWidth - CAVE_WIDTH * TILE_SIZE) / 2f
-        val viewCenterY = viewHeight / 2f
-        val offsetY = viewCenterY - playerY * TILE_SIZE
+        val viewHeight = height.toFloat()
+        val dividerX = viewWidth / 2f
 
-        val yTilesVisible = (viewHeight / TILE_SIZE).toInt() + 2
-        val startY = max(0, playerY.toInt() - yTilesVisible / 2)
-        val endY = min(199, startY + yTilesVisible)
+        canvas.drawRect(0f, 0f, viewWidth, viewHeight, bgPaint)
 
-        for (y in startY..endY) {
-            for (x in 0 until CAVE_WIDTH) {
-                if (revealed[y][x]) {
-                    if (cave[y][x]) {
-                        canvas.drawRect(
-                            offsetX + x * TILE_SIZE,
-                            offsetY + y * TILE_SIZE,
-                            offsetX + (x + 1) * TILE_SIZE - 1,
-                            offsetY + (y + 1) * TILE_SIZE - 1,
-                            wallRevealedPaint
-                        )
-                    }
-                } else {
-                    canvas.drawRect(
-                        offsetX + x * TILE_SIZE,
-                        offsetY + y * TILE_SIZE,
-                        offsetX + (x + 1) * TILE_SIZE - 1,
-                        offsetY + (y + 1) * TILE_SIZE - 1,
-                        bgPaint
-                    )
-                }
-            }
+        canvas.drawLine(dividerX, 0f, dividerX, viewHeight, dividerPaint)
+
+        val now = System.currentTimeMillis()
+
+        for (seg in lines) {
+            val age = now - seg.creationTime
+            val alpha = ((1f - age.toFloat() / FADE_MS) * 255).toInt().coerceIn(0, 255)
+            linePaint.alpha = alpha
+            canvas.drawLine(seg.x1, seg.y1, seg.x2, seg.y2, linePaint)
         }
+        linePaint.alpha = 255
 
-        for (e in enemies) {
-            if (revealed[e.y.toInt().coerceIn(0, 199)][e.x.toInt().coerceIn(0, CAVE_WIDTH - 1)]) {
-                val paint = if (e.stunned > 0) enemyStunnedPaint else enemyPaint
-                canvas.drawCircle(
-                    offsetX + e.x * TILE_SIZE,
-                    offsetY + e.y * TILE_SIZE,
-                    TILE_SIZE * 0.35f,
-                    paint
-                )
-            }
+        for (well in wells) {
+            val age = now - well.creationTime
+            val alpha = ((1f - age.toFloat() / FADE_MS) * 255).toInt().coerceIn(0, 255)
+            val scale = 1f + (1f - age.toFloat() / FADE_MS) * 0.6f
+
+            wellRingPaint.alpha = alpha
+            canvas.drawCircle(well.x, well.y, WELL_RADIUS * scale, wellRingPaint)
+            canvas.drawCircle(well.x, well.y, WELL_RADIUS * scale * 0.55f, wellRingPaint)
+            canvas.drawCircle(well.x, well.y, WELL_RADIUS * scale * 0.2f, wellRingPaint)
+
+            wellFillPaint.alpha = (alpha * 0.3f).toInt().coerceIn(0, 255)
+            canvas.drawCircle(well.x, well.y, WELL_RADIUS * scale, wellFillPaint)
         }
+        wellRingPaint.alpha = 255
+        wellFillPaint.alpha = 0x22
 
-        val px = offsetX + playerX * TILE_SIZE
-        val py = offsetY + playerY * TILE_SIZE
-        canvas.drawCircle(px, py, TILE_SIZE * 0.35f, playerGlowPaint)
-        canvas.drawCircle(px, py, TILE_SIZE * 0.25f, playerPaint)
-
-        directionalBlast?.let { blast ->
-            val progress = blast.elapsed / 600f
-            val angle = blast.angle
-            val rad = blast.radius * (1f - progress)
-            val path = Path()
-            path.moveTo(px, py)
-            path.arcTo(
-                px - rad, py - rad, px + rad, py + rad,
-                Math.toDegrees((-angle + PI / 8).toDouble()).toFloat(),
-                45f * (1f - progress),
-                false
-            )
-            path.close()
-            canvas.drawPath(path, blastPaint)
-        }
-
-        for (ping in sonarPings) {
-            val cx = offsetX + ping.x * TILE_SIZE
-            val cy = offsetY + ping.y * TILE_SIZE
-            val maxDist = ping.radius
-            val currentR = maxDist * ping.lerp()
-            val alpha = ((1f - ping.lerp()) * 0.4).toInt()
-            sonarPaint.alpha = (alpha * 255).toInt()
-            canvas.drawCircle(cx, cy, currentR, sonarPaint)
-        }
+        canvas.drawCircle(charX, charY, CHAR_RADIUS * 2.2f, charGlowPaint)
+        canvas.drawCircle(charX, charY, CHAR_RADIUS, charPaint)
 
         if (gameOver) {
-            val overlay = Paint().apply { color = 0xBB000000.toInt(); style = Paint.Style.FILL }
-            canvas.drawRect(0f, 0f, viewWidth, viewHeight, overlay)
-            val textPaint = Paint().apply {
-                color = 0xFFFF3344.toInt()
+            val overlayPaint = Paint().apply {
+                color = 0xBB000000.toInt()
+                style = Paint.Style.FILL
+            }
+            canvas.drawRect(0f, 0f, viewWidth, viewHeight, overlayPaint)
+
+            val titlePaint = Paint().apply {
+                color = 0xFFFF3366.toInt()
                 textSize = 48f
                 textAlign = Paint.Align.CENTER
                 typeface = Typeface.DEFAULT_BOLD
             }
-            val depthText = "Game Over"
-            canvas.drawText(depthText, viewWidth / 2f, viewHeight / 2f - 24, textPaint)
-            textPaint.textSize = 28f
-            textPaint.color = 0xFFCCCCCC.toInt()
-            val restartText = "Tap to Restart"
-            canvas.drawText(restartText, viewWidth / 2f, viewHeight / 2f + 32, textPaint)
+            canvas.drawText("GAME OVER", viewWidth / 2f, viewHeight / 2f - 24, titlePaint)
+
+            val scorePaint = Paint().apply {
+                color = 0xFFCCCCCC.toInt()
+                textSize = 24f
+                textAlign = Paint.Align.CENTER
+                typeface = Typeface.MONOSPACE
+            }
+            canvas.drawText("Height: ${maxHeight.toInt()}", viewWidth / 2f, viewHeight / 2f + 24, scorePaint)
+
+            val restartPaint = Paint().apply {
+                color = 0xFF888888.toInt()
+                textSize = 22f
+                textAlign = Paint.Align.CENTER
+            }
+            canvas.drawText("Tap to Restart", viewWidth / 2f, viewHeight / 2f + 64, restartPaint)
         }
     }
 
     fun restart() {
-        revealed.forEach { it.fill(false) }
-        enemies.clear()
-        generateCave()
-        playerX = CAVE_WIDTH / 2f
-        playerY = 15f
-        currentDepth = 0
+        val wasGameOver = gameOver
+        lines.clear()
+        wells.clear()
+        charX = width * 0.78f
+        charY = height * 0.25f
+        charVX = 0f
+        charVY = 0f
+        maxHeight = 0f
         gameOver = false
-        sonarPings.clear()
-        directionalBlast = null
+        isDrawing = false
+        longPressTriggered = false
         scoreCallback(0)
+        if (wasGameOver) {
+            post(gameLoop)
+        }
         invalidate()
     }
 }
-
-data class Enemy(var x: Float, var y: Float, var speed: Float = 0.025f, var stunned: Int = 0)
-
-data class SonarPing(val x: Float, val y: Float, val radius: Float, val duration: Int, var elapsed: Int = 0) {
-    fun lerp(): Float = (elapsed.toFloat() / duration).coerceIn(0f, 1f)
-}
-
-data class DirectionalBlast(val x: Float, val y: Float, val angle: Float, val radius: Float, var elapsed: Int = 0)
